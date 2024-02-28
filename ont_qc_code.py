@@ -1,0 +1,150 @@
+"Contains functionality for performing batch QC for an ONT run"
+
+import csv
+import datetime
+import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional, Sequence, List
+import yaml
+
+from robots_core.samples import Sc2MolisExtractDB, Sc2MolisSample
+from robots_core.batch_qc.evaluation import Report, create_report
+from robots_core.batch_qc.io import load_controls_from_yml_file
+from robots_core.batch_qc.metrics import Metric, NumberOfReads, PercentNs
+from robots_core.batch_qc.types import Value
+from util import get_path_to_ont_sample_sheet
+
+
+@dataclass(frozen=True)
+class Sample:
+    "A sample with associated QC data"
+    name: str
+    data_qc: Optional[Dict[str, str]]
+
+    def extract_metric_value(self, metric: Metric) -> Value:
+        "Extract the value of the specified metric type"
+        if metric is NumberOfReads:
+            if self.data_qc is None:
+                logging.info(
+                    "assuming sample %s with no QC entry has zero aligned reads",
+                    self.name,
+                )
+                return 0
+            return int(self.data_qc["num_aligned_reads"])
+
+        if metric is PercentNs:
+            if self.data_qc is None:
+                logging.info(
+                    "assuming sample %s with no QC entry has 100%% Ns",
+                    self.name,
+                )
+                return 100.0
+            return float(self.data_qc["pct_N_bases"])
+
+        raise NotImplementedError()
+
+
+def get_path_to_qc_file(run_name: str, service_dir: Path) -> Path:
+    "Get the path to the given run's QC file"
+    return service_dir.joinpath("results", run_name, run_name + ".qc.csv")
+
+
+def extract_barcode(sample_name: str) -> str:
+    "Extract the barcode ID/index from the specified sample name"
+    barcode_part = sample_name.split("_")[-1]
+    assert barcode_part.startswith("barcode")
+    return barcode_part[7:]
+
+
+def load_qc_file_into_dict(qc_file: Path) -> Dict[str, dict]:
+    "Load the QC data into a dictionary indexed by the barcode ID"
+    with open(qc_file, encoding="utf-8") as file:
+        return {
+            extract_barcode(row["sample_name"]): row
+            for row in csv.DictReader(file)
+        }
+
+
+def load_samples(run_dir: Path, service_dir: Path) -> Sequence[Sample]:
+    "Load the run's samples as a sequence of Sample instances populated with QC data"
+    qc_file = get_path_to_qc_file(run_dir.name, service_dir)
+    qc_dict = load_qc_file_into_dict(qc_file)
+
+    sample_sheet_file = get_path_to_ont_sample_sheet(run_dir)
+    with open(sample_sheet_file, encoding="utf-8") as file:
+        return [
+            Sample(row[1], qc_dict.get(row[0], None))
+            for row in csv.reader(file)
+        ]
+
+
+def create_ont_report(run_dir: Path) -> Report:
+    "Create a QC report for the specified run"
+    service_dir = Path(os.environ['PHENGS_SERVICE_ROOT'])
+    config_file = service_dir.joinpath("pipeline_config", "ont_batch_qc.yml")
+
+    run_samples = load_samples(run_dir, service_dir)
+    control_samples = load_controls_from_yml_file(config_file)
+
+    def metric_getter(sample_name: str, metric: Metric) -> Sequence[Value]:
+        return [
+            sample.extract_metric_value(metric)
+            for sample in run_samples
+            if sample.name.lower() == sample_name.lower()
+        ]
+
+    return create_report(
+        control_samples,
+        metric_getter,
+    )
+
+
+def generate_ont_metadata_report(sample_molis_ids: List[str],
+                                 run_sequencing_date: datetime.date,
+                                 allow_historical_samples: bool,
+                                 molis_extract_conn_details: dict) -> Report:
+    """
+    Create a metadata QC report for the given samples.
+    For each MOLIS ID in the list, get the information on the sample from the
+    Molis DB, and check that the sample's metadata is consistent.
+
+    Parameters
+    -------
+    sample_molis_ids: List[str]
+        List of the MOLIS IDs of the samples to validate.
+    run_sequencing_date: datetime.date
+        Date on which the run was sequenced (determined from run_label). Used
+        as part of validating each sample's metadata.
+    allow_historical_samples: bool
+        Whether to allow samples with large gaps between collection and receipt
+        date to pass metadata checks.
+    molis_extract_conn_details: dict
+        Config for the database connection (for accessing the data on each
+        sample from its MOLIS ID).
+
+    Returns
+    -------
+    report: Report
+        Stores whether the metadata was all valid (in its "success" attribute)
+        as well as details on failed samples if the metadata is not all valid.
+    """
+
+    report = Report()
+    with Sc2MolisExtractDB(
+        host = molis_extract_conn_details['host'],
+        dbname = molis_extract_conn_details['database'],
+        user = molis_extract_conn_details['username'],
+        password = molis_extract_conn_details['password'],
+    ) as molis_extract_db:
+        for molis_id in sample_molis_ids:
+            sample = Sc2MolisSample(molis_id, molis_extract_db)
+            metadata_valid = sample.metadata_is_valid(run_sequencing_date,
+                                                    allow_historical_samples)
+            # Keep the report brief - only add samples with an error
+            if sample.metadata_error != "":
+                description = f"{sample.molis_id}: {sample.metadata_error}"
+                report.add_control_outcome(description, metadata_valid)
+
+    return report
